@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <ModbusRTU.h>
-#include <SensirionI2cScd4x.h>
+#include <Adafruit_SHT31.h>
 #include <DFRobot_ENS160.h>
 #include <LiquidCrystal_I2C.h>
 
@@ -9,15 +9,14 @@
 #define BUTTON_PIN 33
 #define GATEWAY_TIMEOUT 360000
 #define NO_ERROR 0
-#define SLAVE_ID 4
+#define SLAVE_ID 5
 #define REQUEST_DATA_REGN 8
 #define DATA_READY_REGN 9
 #define TEMP_REGN 10
 #define HUMI_REGN 11
-#define CO2_REGN 12
 #define AQI_REGN 13
 #define TVOC_REGN 14
-#define STATUS_SCD41_REGN 15
+#define STATUS_SHT30_REGN 15
 #define STATUS_ENS160_REGN 16
 // Các thanh ghi STATUS biểu thị việc đọc cảm biến có thành công hay 0. 0 là thành công và ngc lại. Nếu việc khởi tạo thất bại thì chắc chắn luôn đọc lỗi nên thanh ghi luôn = 1.
 
@@ -27,7 +26,7 @@ SemaphoreHandle_t currentScreenMutex;
 ModbusRTU mb;
 HardwareSerial RS485Serial(2);
 
-static SensirionI2cScd4x sensor;
+Adafruit_SHT31 sht30 = Adafruit_SHT31();
 static char errorMessage[64];
 static int16_t error;
 
@@ -39,8 +38,7 @@ enum LCDScreen {
     SCREEN_WAITING_REQUEST,
     SCREEN_PREPARE_DATA,
     SCREEN_TEMP_HUMI,
-    SCREEN_CO2_TVOC,
-    SCREEN_AQI,
+    SCREEN_TVOC_AQI,
     SCREEN_GATEWAY_OFFLINE
 };
 
@@ -51,16 +49,17 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 bool isLCDOn = false;
 uint8_t lastButtonState = LOW;
 
+bool sht30Initialized = false;
 bool ens160Initialized = false;
-bool errSCD41 = false;
+bool errSHT30 = false;
 float temperature = 0;
 float humidity = 0;
 uint16_t co2 = 0;
 uint8_t aqi = 0;
 uint16_t tvoc = 0;
 
-void SCD41_Init();
-bool SCD41_ReadData(uint16_t &co2, float &temperature, float &humidity);
+bool SHT30_Init();
+bool SHT30_ReadData(float &temperature, float &humidity);
 bool ENS160_Init();
 void ENS160_ReadData(uint8_t &aqi, uint16_t &tvoc, float temperature, float humidity);
 void LCD_ShowScreen(uint8_t currentScreen);
@@ -136,15 +135,32 @@ void setup()
     // Thanh ghi dữ liệu cảm biến 
     mb.addHreg(TEMP_REGN);
     mb.addHreg(HUMI_REGN);
-    mb.addHreg(CO2_REGN);
     mb.addHreg(AQI_REGN);
     mb.addHreg(TVOC_REGN);
 
     // Thanh ghi trạng thái lỗi 
-    mb.addHreg(STATUS_SCD41_REGN, 0);
+    mb.addHreg(STATUS_SHT30_REGN, 0);
     mb.addHreg(STATUS_ENS160_REGN, 0);
 
-    SCD41_Init();
+    for (int i = 0; i < 5; i++)
+    {
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+            sht30Initialized = SHT30_Init();
+            xSemaphoreGive(i2cMutex);
+        }
+        if (sht30Initialized)
+        {
+            break;
+        }
+        if (i < 4)
+        {
+            delay(500);
+        }
+        else
+        {
+            mb.Hreg(STATUS_SHT30_REGN, 1);
+        }
+    }
 
     for (int i = 0; i < 5; i++)
     {
@@ -187,46 +203,34 @@ void loop()
     yield();   // Avoid watchdog reset on ESP chips
 }
 
-void SCD41_Init()
+bool SHT30_Init()
 {
-    sensor.begin(Wire, SCD41_I2C_ADDR_62);
-    delay(30);
-
-    sensor.wakeUp();
-
-    sensor.stopPeriodicMeasurement();
-
-    sensor.reinit();
+    if (!sht30.begin(0x44)) {   // Set to 0x45 for alternate i2c addr
+      Serial.println("Couldn't find SHT30");
+      return false;
+    }
+    return true;
 }
 
-bool SCD41_ReadData(uint16_t &co2, float &temperature, float &humidity)
+bool SHT30_ReadData(float &temperature, float &humidity)
 {
-    error = sensor.wakeUp();
-    if (error != NO_ERROR)
-    {
-        return false;
-    }
-
-    error = sensor.measureSingleShot();
-    if (error != NO_ERROR)
-    {
-        return false;
-    }
-
-    uint32_t co2Sum = 0;
     float tempSum = 0;
     float humiSum = 0;
     int validReadings = 0;
 
     for (int i = 0; i < 3; i++)
     {
-        uint16_t tempCO2;
         float tempTemp, tempHumi;
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+          tempTemp = sht30.readTemperature();
+          tempHumi = sht30.readHumidity();
+          xSemaphoreGive(i2cMutex);
+        } else {
+            continue;
+        }
 
-        error = sensor.measureAndReadSingleShot(tempCO2, tempTemp, tempHumi);
-        if (error == NO_ERROR)
+        if (!isnan(tempTemp) && !isnan(tempHumi))
         {
-            co2Sum += tempCO2;
             tempSum += tempTemp;
             humiSum += tempHumi;
             validReadings++;
@@ -234,13 +238,12 @@ bool SCD41_ReadData(uint16_t &co2, float &temperature, float &humidity)
 
         if (i < 2)
         {
-            vTaskDelay(500 / portTICK_PERIOD_MS);
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
     }
 
     if (validReadings > 0)
     {
-        co2 = co2Sum / validReadings;
         temperature = tempSum / validReadings;
         humidity = humiSum / validReadings;
         return true;
@@ -338,43 +341,33 @@ void LCD_ShowScreen(uint8_t currentScreen) {
         case SCREEN_TEMP_HUMI:
             lcd.setCursor(0, 0);
             lcd.print("Temp: ");
-            if (errSCD41) {
-                lcd.print("N/A");
-            } else {
+            if (sht30Initialized && !errSHT30) {
                 lcd.print(temperature, 1);
                 lcd.print((char)223);
                 lcd.print("C");
+            } else {
+                lcd.print("N/A");
             }
             lcd.setCursor(0, 1);
             lcd.print("Humi: ");
-            if (errSCD41) {
-                lcd.print("N/A");
-            } else {
-                lcd.print(humidity);
+            if (sht30Initialized && !errSHT30) {
+                lcd.print(humidity, 1);
                 lcd.print("%");
+            } else {
+                lcd.print("N/A");
             }
             break;
-        case SCREEN_CO2_TVOC:
+        case SCREEN_TVOC_AQI:
             lcd.setCursor(0, 0);
-            lcd.print("CO2:");
-            if (errSCD41) {
-                lcd.print("N/A");
-            } else {
-                lcd.print(co2);
-                lcd.print(" ppm");
-            }
-            lcd.setCursor(0, 1);
-            lcd.print("TVOC:");
+            lcd.print("TVOC: ");
             if (ens160Initialized) {
                 lcd.print(tvoc);
                 lcd.print(" ppb");
             } else {
                 lcd.print("N/A");
             }
-            break;
-        case SCREEN_AQI:
-            lcd.setCursor(0, 0);
-            lcd.print("AQI:");
+            lcd.setCursor(0, 1);
+            lcd.print("AQI: ");
             if (ens160Initialized) {
                 lcd.print(aqi);
             } else {
@@ -390,18 +383,17 @@ void LCD_ShowScreen(uint8_t currentScreen) {
 
 void readSensors()
 {
-    if (SCD41_ReadData(co2, temperature, humidity))
+    if (SHT30_ReadData(temperature, humidity))
     {
-        errSCD41 = false;
-        mb.Hreg(CO2_REGN, co2);
+        errSHT30 = false;
         mb.Hreg(TEMP_REGN, (uint16_t)(temperature * 100));
         mb.Hreg(HUMI_REGN, (uint16_t)(humidity * 100));
-        mb.Hreg(STATUS_SCD41_REGN, 0);
+        mb.Hreg(STATUS_SHT30_REGN, 0);
     }
     else
     {
-        errSCD41 = true;
-        mb.Hreg(STATUS_SCD41_REGN, 1);
+        errSHT30 = true;
+        mb.Hreg(STATUS_SHT30_REGN, 1);
     }
 
     if (ens160Initialized)
@@ -442,7 +434,7 @@ void Task_SystemMonitor(void *pvParameters)
             digitalWrite(PUMP_PIN, LOW);
             vTaskDelay(15000 / portTICK_PERIOD_MS);
             digitalWrite(PUMP_PIN, HIGH);
-            vTaskDelay(60000 / portTICK_PERIOD_MS);
+            vTaskDelay(78000 / portTICK_PERIOD_MS);
             readSensors();
             mb.Hreg(DATA_READY_REGN, 1);
             mb.Hreg(REQUEST_DATA_REGN, 0);
@@ -468,7 +460,7 @@ void Task_SystemMonitor(void *pvParameters)
                 if (currentScreen == SCREEN_PREPARE_DATA) {
                     currentScreen = SCREEN_TEMP_HUMI;
                 } else {
-                    currentScreen = SCREEN_TEMP_HUMI + (currentScreen - SCREEN_TEMP_HUMI + 1) % 3;
+                    currentScreen = SCREEN_TEMP_HUMI + (currentScreen - SCREEN_TEMP_HUMI + 1) % 2;
                 }
                 xSemaphoreGive(currentScreenMutex);
             }
